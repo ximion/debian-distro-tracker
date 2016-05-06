@@ -41,6 +41,7 @@ from distro_tracker.core.models import PackageName
 from distro_tracker.core.models import SourcePackage
 from distro_tracker.core.models import PseudoPackageName
 from distro_tracker.core.models import SourcePackageName
+from distro_tracker.core.models import BinaryPackageName
 from distro_tracker.core.models import Repository
 from distro_tracker.core.tasks import run_task
 from distro_tracker.core.retrieve_data import UpdateRepositoriesTask
@@ -76,6 +77,8 @@ from distro_tracker.vendor.debian.models import DebianContributor
 from distro_tracker.vendor.debian.models import UbuntuPackage
 from distro_tracker.vendor.debian.tracker_tasks import UpdateLintianStatsTask
 from distro_tracker.vendor.debian.models import LintianStats
+from distro_tracker.vendor.debian.tracker_tasks import UpdateAppStreamStatsTask
+from distro_tracker.vendor.debian.models import AppStreamStats
 from distro_tracker.vendor.debian.management.commands\
     .tracker_import_old_subscriber_dump \
     import Command as ImportOldSubscribersCommand
@@ -93,6 +96,7 @@ import os
 import yaml
 import json
 import logging
+import zlib
 
 logging.disable(logging.CRITICAL)
 
@@ -1402,6 +1406,676 @@ class UpdateLintianStatsTaskTest(TestCase):
 
         # An action item is created.
         self.assertEqual(2, self.package_name.action_items.count())
+
+
+class UpdateAppStreamStatsTaskTest(TestCase):
+
+    """
+    Tests for the
+    :class:`distro_tracker.vendor.debian.tracker_tasks.UpdateAppStreamStatsTask`
+    task.
+    """
+
+    def setUp(self):
+        self.package_name = SourcePackageName.objects.create(
+            name='dummy-package')
+        self.package = SourcePackage(
+            source_package_name=self.package_name, version='1.0.0')
+
+        self._tagdef_url = u'https://appstream.debian.org/hints/asgen-hints.json'
+        self._hints_url_template = u'https://appstream.debian.org/hints/sid/{section}/Hints-{arch}.json.gz'
+        self._tag_definitions = """{
+                "tag-mock-error": {
+                  "text": "Mocking an error tag.",
+                  "severity": "error"
+                },
+                "tag-mock-warning": {
+                  "text": "Mocking a warning tag.",
+                  "severity": "warning"
+                },
+                "tag-mock-info": {
+                  "text": "Mocking an info tag.",
+                  "severity": "info"
+                }
+            }"""
+
+    def run_task(self):
+        """
+        Runs the AppStream hints update task.
+        """
+        task = UpdateAppStreamStatsTask()
+        task.execute()
+
+    def _set_mock_response(self, mock_requests, text="", status_code=200):
+        """
+        Helper method which sets a mock response to the given mock requests
+        module.
+        """
+
+        mock_response = mock_requests.models.Response()
+        mock_response.status_code = status_code
+        mock_response.ok = status_code < 400
+
+        def compress_text(s):
+            """
+            Helper to GZip-compress a string.
+            """
+            compressor = zlib.compressobj(9,
+                                          zlib.DEFLATED,
+                                          16 + zlib.MAX_WBITS,
+                                          zlib.DEF_MEM_LEVEL,
+                                          0)
+            data = compressor.compress(s)
+            data += compressor.flush()
+            return data
+
+        def build_response(*args, **kwargs):
+            if args[0] == self._tagdef_url:
+                # the tag definitions are requested
+                mock_response.content = self._tag_definitions.encode('utf-8')
+                mock_response.json.return_value = json.loads(self._tag_definitions)
+            elif args[0] == self._hints_url_template.format(section='main', arch='amd64'):
+                # hint data was requested
+                data = compress_text(text)
+                mock_response.text = data
+                mock_response.content = data
+            else:
+                # return a compressed, but empty hints document as default
+                data = compress_text('[]')
+                mock_response.text = data
+                mock_response.content = data
+
+            return mock_response
+
+        mock_requests.get.side_effect = build_response
+
+    def get_action_item_type(self):
+        return ActionItemType.objects.get_or_create(
+            type_name=UpdateAppStreamStatsTask.ACTION_ITEM_TYPE_NAME)[0]
+
+    def assert_correct_severity_stats(self, hints, expected_hints):
+        """
+        Helper method which asserts that the given hint stats match the expected
+        stats.
+        """
+        for severity in ['errors', 'warnings', 'infos']:
+            count = hints[severity] if severity in hints else 0
+            expected_count = expected_hints[severity] if severity in expected_hints else 0
+            self.assertEqual(count, expected_count)
+
+    def assert_action_item_error_and_warning_count(self, item, errors=0, warnings=0):
+        """
+        Helper method which checks if an instance of
+        :class:`distro_tracker.core.ActionItem` contains the given error and
+        warning count in its extra_data.
+        """
+        self.assertEqual(item.extra_data['errors'], errors)
+        self.assertEqual(item.extra_data['warnings'], warnings)
+
+    @mock.patch('distro_tracker.core.utils.http.requests')
+    def test_hint_stats_created(self, mock_requests):
+        """
+        Tests that stats are created for a package that previously did not have
+        any AppStream stats.
+        """
+
+        testdata = """[{
+          "package": "dummy-package\/1.0\/amd64",
+          "hints": {
+            "org.example.test1.desktop": [
+              {
+                  "vars": {
+                      "icon_fname": "dummy.xpm"
+                  },
+                  "tag": "tag-mock-error"
+              }
+            ],
+            "org.example.test2.desktop": [
+              {
+                  "vars": {
+                      "icon_fname": "dummy.xpm"
+                  },
+                  "tag": "tag-mock-error"
+              },
+              {
+                  "vars": { },
+                  "tag": "tag-mock-warning"
+              }
+            ]
+          }
+        }]"""
+
+        self._set_mock_response(mock_requests, text=testdata)
+
+        self.run_task()
+
+        # The stats have been created
+        self.assertEqual(1, AppStreamStats.objects.count())
+        # They are associated with the correct package.
+        stats = AppStreamStats.objects.all()[0]
+        self.assertEqual(stats.package.name, 'dummy-package')
+        # The category counts themselves are correct
+        self.assert_correct_severity_stats(stats.stats, {'errors': 2, 'warnings': 1, 'infos': 0})
+
+    @mock.patch('distro_tracker.core.utils.http.requests')
+    def test_hint_stats_updated(self, mock_requests):
+        """
+        Tests that when a package already had associated AppStream stats, they are
+        correctly updated after running the task.
+        """
+
+        # Create the pre-existing stats for the package
+        AppStreamStats.objects.create(
+            package=self.package_name, stats={'errors': 1, 'warnings': 3})
+
+        as_hints_data = """[{
+          "package": "dummy-package\/1.0\/amd64",
+          "hints": {
+            "org.example.test.desktop": [
+              {
+                  "vars": {},
+                  "tag": "tag-mock-error"
+              },
+              {
+                  "vars": {},
+                  "tag": "tag-mock-error"
+              }
+            ]
+          }
+        }]"""
+
+        self._set_mock_response(mock_requests, text=as_hints_data)
+
+        self.run_task()
+
+        # Still only one AppStream stats object
+        self.assertEqual(1, AppStreamStats.objects.count())
+        # The package is still correct
+        stats = AppStreamStats.objects.all()[0]
+        self.assertEqual(stats.package.name, 'dummy-package')
+        # The stats have been updated
+        self.assert_correct_severity_stats(stats.stats, {'errors': 2, 'warnings': 0, 'infos': 0})
+
+    @mock.patch('distro_tracker.core.utils.http.requests')
+    def test_stats_created_multiple_packages(self, mock_requests):
+        """
+        Tests that stats are correctly creatd when there are stats for
+        multiple packages in the response.
+        """
+        # Create a second package.
+        SourcePackageName.objects.create(name='other-package')
+
+        as_hints_data = """[
+        {
+          "package": "dummy-package\/1.0\/amd64",
+          "hints": {
+            "org.example.test1.desktop": [
+              {
+                  "vars": {},
+                  "tag": "tag-mock-error"
+              },
+              {
+                  "vars": {},
+                  "tag": "tag-mock-error"
+              }
+            ]
+          }
+        },
+        {
+          "package": "other-package\/1.2\/amd64",
+          "hints": {
+            "org.example.test2.desktop": [
+              {
+                  "vars": {},
+                  "tag": "tag-mock-error"
+              },
+              {
+                  "vars": {},
+                  "tag": "tag-mock-warning"
+              }
+            ]
+          }
+        }
+        ]"""
+
+        self._set_mock_response(mock_requests, text=as_hints_data)
+        self.run_task()
+
+        # Stats created for both packages
+        self.assertEqual(2, AppStreamStats.objects.count())
+        all_names = [stats.package.name
+                     for stats in AppStreamStats.objects.all()]
+        self.assertIn('dummy-package', all_names)
+        self.assertIn('other-package', all_names)
+
+    @mock.patch('distro_tracker.core.utils.http.requests')
+    def test_stats_associated_with_source(self, mock_requests):
+        """
+        Tests that we correctly map the binary packages to source packages,
+        and the stats are accurate.
+        """
+
+        # Create source packages and connected binary packages
+        bin1 = BinaryPackageName.objects.create(name="alpha-package-bin")
+        bin2 = BinaryPackageName.objects.create(name="alpha-package-data")
+
+        src_name1 = SourcePackageName.objects.create(name='alpha-package')
+        src_pkg1, _ = SourcePackage.objects.get_or_create(
+            source_package_name=src_name1, version='1.0.0')
+        src_pkg1.binary_packages = [bin1, bin2]
+        src_pkg1.save()
+
+        bin3 = BinaryPackageName.objects.create(name="beta-common")
+        src_name2 = SourcePackageName.objects.create(name='beta-package')
+        src_pkg2, _ = SourcePackage.objects.get_or_create(
+            source_package_name=src_name2, version='1.2.0')
+        src_pkg2.binary_packages = [bin3]
+        src_pkg2.save()
+
+        # Set mock data
+        as_hints_data = """[
+        {
+          "package": "alpha-package-bin\/1.0\/amd64",
+          "hints": {
+            "org.example.AlphaTest1.desktop": [
+              { "tag": "tag-mock-error", "vars": {} },
+              { "tag": "tag-mock-warning", "vars": {} }
+            ]
+          }
+        },
+        {
+          "package": "alpha-package-data\/1.0\/amd64",
+          "hints": {
+            "org.example.AlphaTest2.desktop": [
+              { "tag": "tag-mock-warning", "vars": {} }
+            ]
+          }
+        },
+        {
+          "package": "beta-common\/1.2\/amd64",
+          "hints": {
+            "org.example.BetaTest1.desktop": [
+              { "tag": "tag-mock-error", "vars": {} },
+              { "tag": "tag-mock-error", "vars": {} }
+            ]
+          }
+        }
+        ]"""
+
+        self._set_mock_response(mock_requests, text=as_hints_data)
+        self.run_task()
+
+        # Stats created for two source packages
+        self.assertEqual(2, AppStreamStats.objects.count())
+        all_names = [stats.package.name
+                     for stats in AppStreamStats.objects.all()]
+
+        # source packages should be in the result
+        self.assertIn('alpha-package', all_names)
+        self.assertIn('beta-package', all_names)
+
+        # binary packages should not be there
+        self.assertNotIn('alpha-package-bin', all_names)
+        self.assertNotIn('alpha-package-data', all_names)
+        self.assertNotIn('beta-common', all_names)
+
+        # check if the stats are correct
+        stats = AppStreamStats.objects.get(package__name='alpha-package')
+        self.assert_correct_severity_stats(stats.stats, {'errors': 1, 'warnings': 2, 'infos': 0})
+
+        stats = AppStreamStats.objects.get(package__name='beta-package')
+        self.assert_correct_severity_stats(stats.stats, {'errors': 2, 'warnings': 0, 'infos': 0})
+
+    @mock.patch('distro_tracker.core.utils.http.requests')
+    def test_unknown_package(self, mock_requests):
+        """
+        Tests that when an unknown package is encountered, no stats are created.
+        """
+
+        as_hints_data = """[{
+          "package": "nonexistant\/1.0\/amd64",
+          "hints": {
+            "org.example.test.desktop": [
+              {
+                  "vars": {},
+                  "tag": "tag-mock-error"
+              }
+            ]
+          }
+        }]"""
+
+        self._set_mock_response(mock_requests, text=as_hints_data)
+        self.run_task()
+
+        # There are no stats
+        self.assertEqual(0, AppStreamStats.objects.count())
+
+    @mock.patch('distro_tracker.core.utils.http.requests')
+    def test_action_item_updated(self, mock_requests):
+        """
+        Tests that an existing action item is updated with new data.
+        """
+        # Create an existing action item
+        old_item = ActionItem.objects.create(
+            package=self.package_name,
+            item_type=self.get_action_item_type(),
+            short_description="Short description...",
+            extra_data={'errors': 1, 'warnings': 2})
+        old_timestamp = old_item.last_updated_timestamp
+
+        as_hints_data = """[{
+          "package": "dummy-package\/1.0\/amd64",
+          "hints": {
+            "org.example.test.desktop": [
+              {
+                  "vars": {},
+                  "tag": "tag-mock-error"
+              },
+              {
+                  "vars": {},
+                  "tag": "tag-mock-error"
+              }
+            ]
+          }
+        }]"""
+
+        self._set_mock_response(mock_requests, text=as_hints_data)
+
+        self.run_task()
+
+        # An action item is created.
+        self.assertEqual(1, ActionItem.objects.count())
+        # Extra data updated?
+        item = ActionItem.objects.all()[0]
+        self.assert_action_item_error_and_warning_count(item, 2, 0)
+
+        # The timestamp is updated
+        self.assertNotEqual(old_timestamp, item.last_updated_timestamp)
+
+    @mock.patch('distro_tracker.core.utils.http.requests')
+    def test_action_item_not_updated(self, mock_requests):
+        """
+        Tests that an existing action item is left unchanged when the update
+        shows unchanged stats.
+        """
+        errors, warnings = 2, 0
+        # Create an existing action item
+        old_item = ActionItem.objects.create(
+            package=self.package_name,
+            item_type=self.get_action_item_type(),
+            short_description="Short description...",
+            extra_data={'appstream_url': u'https://appstream.debian.org/sid/main/issues/index.html#',
+                        'errors': errors,
+                        'warnings': warnings})
+        old_timestamp = old_item.last_updated_timestamp
+
+        as_hints_data = """[{
+          "package": "dummy-package\/1.0\/amd64",
+          "hints": {
+            "org.example.test.desktop": [
+              {
+                  "vars": {},
+                  "tag": "tag-mock-error"
+              },
+              {
+                  "vars": {},
+                  "tag": "tag-mock-error"
+              }
+            ]
+          }
+        }]"""
+
+        self._set_mock_response(mock_requests, text=as_hints_data)
+        self.run_task()
+
+        # An action item is created.
+        self.assertEqual(1, ActionItem.objects.count())
+        # Item unchanged?
+        item = ActionItem.objects.all()[0]
+        self.assertEqual(old_timestamp, item.last_updated_timestamp)
+
+    @mock.patch('distro_tracker.core.utils.http.requests')
+    def test_action_item_created(self, mock_requests):
+        """
+        Tests that an action item is created when the package has errors and
+        warnings.
+        """
+
+        # Sanity check: there were no action items in the beginning
+        self.assertEqual(0, ActionItem.objects.count())
+
+        as_hints_data = """[{
+          "package": "dummy-package\/1.0\/amd64",
+          "hints": {
+            "org.example.test.desktop": [
+              {
+                  "vars": {},
+                  "tag": "tag-mock-error"
+              },
+              {
+                  "vars": {},
+                  "tag": "tag-mock-warning"
+              }
+            ]
+          }
+        }]"""
+
+        self._set_mock_response(mock_requests, text=as_hints_data)
+        self.run_task()
+
+        # An action item is created.
+        self.assertEqual(1, ActionItem.objects.count())
+        # The item is linked to the correct package
+        item = ActionItem.objects.all()[0]
+        self.assertEqual(item.package.name, self.package_name.name)
+        # The correct number of errors and warnings is stored in the item
+        self.assert_action_item_error_and_warning_count(item, errors=1, warnings=1)
+        # It is a high severity issue
+        self.assertEqual('high', item.get_severity_display())
+
+    @mock.patch('distro_tracker.core.utils.http.requests')
+    def test_action_item_not_created(self, mock_requests):
+        """
+        Tests that no action item is created when the package has no errors or
+        warnings.
+        """
+
+        # Sanity check: there were no action items in the beginning
+        self.assertEqual(0, ActionItem.objects.count())
+
+        as_hints_data = """[{
+          "package": "dummy-package\/1.0\/amd64",
+          "hints": {
+            "org.example.test.desktop": [
+              {
+                  "vars": {},
+                  "tag": "tag-mock-info"
+              }
+            ]
+          }
+        }]"""
+
+        self._set_mock_response(mock_requests, text=as_hints_data)
+        self.run_task()
+
+        # Still no action items.
+        self.assertEqual(0, ActionItem.objects.count())
+
+    @mock.patch('distro_tracker.core.utils.http.requests')
+    def test_action_item_created_errors(self, mock_requests):
+        """
+        Tests that an action item is created when the package has errors.
+        """
+
+        # Sanity check: there were no action items in the beginning
+        self.assertEqual(0, ActionItem.objects.count())
+
+        as_hints_data = """[{
+          "package": "dummy-package\/1.0\/amd64",
+          "hints": {
+            "org.example.test.desktop": [
+              { "tag": "tag-mock-error", "vars": {} },
+              { "tag": "tag-mock-error", "vars": {} }
+            ]
+          }
+        }]"""
+
+        self._set_mock_response(mock_requests, text=as_hints_data)
+        self.run_task()
+
+        # An action item is created.
+        self.assertEqual(1, ActionItem.objects.count())
+        # The correct number of errors and warnings is stored in the item
+        item = ActionItem.objects.all()[0]
+        self.assert_action_item_error_and_warning_count(item, errors=2, warnings=0)
+        # It has the correct type
+        self.assertEqual(
+            item.item_type.type_name,
+            UpdateAppStreamStatsTask.ACTION_ITEM_TYPE_NAME)
+        # It is a high severity issue
+        self.assertEqual('high', item.get_severity_display())
+        # Correct full description template
+        self.assertEqual(
+            item.full_description_template,
+            UpdateAppStreamStatsTask.ITEM_FULL_DESCRIPTION_TEMPLATE)
+
+    @mock.patch('distro_tracker.core.utils.http.requests')
+    def test_action_item_created_errors(self, mock_requests):
+        """
+        Tests that an action item is created when the package has warnings.
+        """
+
+        # Sanity check: there were no action items in the beginning
+        self.assertEqual(0, ActionItem.objects.count())
+
+        as_hints_data = """[{
+          "package": "dummy-package\/1.0\/amd64",
+          "hints": {
+            "org.example.test.desktop": [
+              { "tag": "tag-mock-warning", "vars": {} },
+              { "tag": "tag-mock-warning", "vars": {} }
+            ]
+          }
+        }]"""
+
+        self._set_mock_response(mock_requests, text=as_hints_data)
+        self.run_task()
+
+        # An action item is created.
+        self.assertEqual(1, ActionItem.objects.count())
+        # The correct number of errors and warnings is stored in the item
+        item = ActionItem.objects.all()[0]
+        self.assert_action_item_error_and_warning_count(item, errors=0, warnings=2)
+        # It should be a normal severity issue
+        self.assertEqual('normal', item.get_severity_display())
+
+    @mock.patch('distro_tracker.core.utils.http.requests')
+    def test_action_item_removed(self, mock_requests):
+        """
+        Tests that a previously existing action item is removed if the updated
+        hints no longer contain errors or warnings.
+        """
+        # Make sure an item exists for the package
+        ActionItem.objects.create(
+            package=self.package_name,
+            item_type=self.get_action_item_type(),
+            short_description="Short description...",
+            extra_data={'errors': 1, 'warnings': 2})
+
+        as_hints_data = """[{
+          "package": "dummy-package\/1.0\/amd64",
+          "hints": {
+            "org.example.test.desktop": [
+              { "tag": "tag-mock-info", "vars": {} }
+            ]
+          }
+        }]"""
+
+        self._set_mock_response(mock_requests, text=as_hints_data)
+        self.run_task()
+
+        # There are no action items any longer.
+        self.assertEqual(0, self.package_name.action_items.count())
+
+    @mock.patch('distro_tracker.core.utils.http.requests')
+    def test_action_item_removed_no_data(self, mock_requests):
+        """
+        Tests that a previously existing action item is removed when the
+        updated hints no longer contain any information for the package.
+        """
+        ActionItem.objects.create(
+            package=self.package_name,
+            item_type=self.get_action_item_type(),
+            short_description="Short description...",
+            extra_data={'errors': 1, 'warnings': 2})
+
+        as_hints_data = """[{
+          "package": "some-unrelated-package\/1.0\/amd64",
+          "hints": {
+            "org.example.test.desktop": [
+              { "tag": "tag-mock-error", "vars": {} }
+            ]
+          }
+        }]"""
+
+        self._set_mock_response(mock_requests, text=as_hints_data)
+        self.run_task()
+
+        # There are no action items any longer.
+        self.assertEqual(0, self.package_name.action_items.count())
+
+    @mock.patch('distro_tracker.core.utils.http.requests')
+    def test_action_item_created_multiple_packages(self, mock_requests):
+        """
+        Tests that action items are created correctly when there are stats
+        for multiple different packages in the response.
+        """
+
+        other_package = PackageName.objects.create(
+            name='other-package',
+            source=True)
+        # Sanity check: there were no action items in the beginning
+        self.assertEqual(0, ActionItem.objects.count())
+
+        as_hints_data = """[{
+          "package": "dummy-package\/1.0\/amd64",
+          "hints": {
+            "org.example.test1.desktop": [
+              { "tag": "tag-mock-error", "vars": {} },
+              { "tag": "tag-mock-error", "vars": {} }
+            ]
+          }
+        },
+        {
+          "package": "other-package\/1.4\/amd64",
+          "hints": {
+            "org.example.test2.desktop": [
+              { "tag": "tag-mock-warning", "vars": {} },
+              { "tag": "tag-mock-warning", "vars": {} }
+            ]
+          }
+        },
+        {
+          "package": "some-package\/1.0\/amd64",
+          "hints": {
+            "org.example.test3.desktop": [
+              { "tag": "tag-mock-error", "vars": {} }
+            ]
+          }
+        }]"""
+
+        self._set_mock_response(mock_requests, text=as_hints_data)
+        self.run_task()
+
+        # Action items are created for two packages.
+        self.assertEqual(1, self.package_name.action_items.count())
+        self.assertEqual(1, other_package.action_items.count())
+        # The items contain correct data.
+        item = self.package_name.action_items.all()[0]
+        self.assert_action_item_error_and_warning_count(item, errors=2, warnings=0)
+
+        item = other_package.action_items.all()[0]
+        self.assert_action_item_error_and_warning_count(item, errors=0, warnings=2)
 
 
 class DebianBugActionItemsTests(TestCase):

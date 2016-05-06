@@ -1,0 +1,10 @@
+{% with appstream_hints=item.context.appstream_hints %}
+<a href="{{ item.context.appstream_url }}" title="report about metadata issues spotted by AppStream">appstream</a>
+{% if appstream_hints.errors or appstream_hints.warnings %}
+{% with warnings=appstream_hints.warnings|default:"0" %}
+{% with errors=appstream_hints.errors|default:"0" %}
+<small>(<span title="errors">{{ errors }}</span>, <span title="warnings">{{ warnings }}</span>)</small>
+{% endwith %}
+{% endwith %}
+{% endif %}
+{% endwith %}

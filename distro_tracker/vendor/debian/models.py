@@ -89,6 +89,51 @@ class LintianStats(models.Model):
 
 
 @python_2_unicode_compatible
+class AppStreamStats(models.Model):
+    """
+    Model for AppStream hint stats of packages.
+    """
+    package = models.OneToOneField(PackageName, related_name='appstream_stats')
+    stats = JSONField()
+
+    def __str__(self):
+        return 'AppStream hints for package {package}'.format(
+            package=self.package)
+
+    def get_appstream_url(self):
+        """
+        Returns the AppStream URL for the package matching the
+        :class:`AppStreamStats
+        <distro_tracker.vendor.debian.models.AppStreamHints>`.
+        """
+        package = get_or_none(SourcePackageName, pk=self.package.pk)
+        if not package:
+            return ''
+        maintainer_email = ''
+        if package.main_version:
+            maintainer = package.main_version.maintainer
+            if maintainer:
+                maintainer_email = maintainer.email
+        # Adapt the maintainer URL to the form expected by appstream.d.o
+        pkg_maintainer_email = re.sub(
+            r"""[àáèéëêòöøîìùñ~/\(\)" ']""",
+            '_',
+            maintainer_email)
+
+        if not package.main_version:
+            return ''
+
+        # TODO: What is the proper way to get (guess?) the archive-component vai the source-pkg here?
+        section = "main"
+
+        return (
+            'https://appstream.debian.org/sid/{section}/issues/index.html#{maintainer}'.format(
+                section=section,
+                maintainer=pkg_maintainer_email)
+        )
+
+
+@python_2_unicode_compatible
 class PackageTransition(models.Model):
     package = models.ForeignKey(PackageName, related_name='package_transitions')
     transition_name = models.CharField(max_length=50)

@@ -28,6 +28,7 @@ from distro_tracker.core.panels import TemplatePanelItem
 from distro_tracker.vendor.debian.models import LintianStats
 from distro_tracker.vendor.debian.models import PackageExcuses
 from distro_tracker.vendor.debian.models import UbuntuPackage
+from distro_tracker.vendor.debian.models import AppStreamHints
 
 
 class LintianLink(LinksPanel.ItemProvider):
@@ -53,6 +54,35 @@ class LintianLink(LinksPanel.ItemProvider):
                 TemplatePanelItem('debian/lintian-link.html', {
                     'lintian_stats': lintian_stats.stats,
                     'lintian_url': url,
+                })
+            ]
+
+        return []
+
+
+class AppStreamLink(LinksPanel.ItemProvider):
+    """
+    If there are any known AppStream hints for the package, provides a link to
+    the AppStream hints page.
+    """
+    def get_panel_items(self):
+        try:
+            appstream_hints = self.package.appstream_hints
+        except AppStreamHints.DoesNotExist:
+            return []
+
+        if sum(appstream_hints.hints.values()):
+            warnings, errors = (
+                appstream_hints.hints.get('warnings', 0),
+                appstream_hints.hints.get('errors', 0))
+            has_errors_or_warnings = warnings or errors
+            # Get the full URL only if the package does not have any errors or
+            # warnings
+            url = appstream_hints.get_appstream_url()
+            return [
+                TemplatePanelItem('debian/appstream-link.html', {
+                    'appstream_hints': appstream_hints.hints,
+                    'appstream_url': url,
                 })
             ]
 

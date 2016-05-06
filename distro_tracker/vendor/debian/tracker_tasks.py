@@ -35,6 +35,7 @@ from distro_tracker.vendor.debian.models import BuildLogCheckStats
 from distro_tracker.vendor.debian.models import PackageTransition
 from distro_tracker.vendor.debian.models import PackageExcuses
 from distro_tracker.vendor.debian.models import UbuntuPackage
+from distro_tracker.vendor.debian.models import AppStreamStats
 from distro_tracker.core.utils.http import HttpCache
 from distro_tracker.core.utils.http import get_resource_content
 from distro_tracker.core.utils.packages import package_hashdir
@@ -45,6 +46,7 @@ import collections
 import os
 import re
 import json
+import zlib
 import hashlib
 import itertools
 
@@ -696,6 +698,178 @@ class UpdateLintianStatsTask(BaseTask):
             self.update_action_item(package, lintian_stats)
 
         LintianStats.objects.bulk_create(stats)
+
+
+class UpdateAppStreamStatsTask(BaseTask):
+    """
+    Updates packages' AppStream issue hints data.
+    """
+    ACTION_ITEM_TYPE_NAME = 'appstream-issue-hints'
+    ITEM_DESCRIPTION = 'AppStream hints: <a href="{url}">{report}</a>'
+    ITEM_FULL_DESCRIPTION_TEMPLATE = 'debian/appstream-action-item.html'
+
+    def __init__(self, force_update=False, *args, **kwargs):
+        super(UpdateAppStreamStatsTask, self).__init__(*args, **kwargs)
+        self.force_update = force_update
+        self.appstream_action_item_type = ActionItemType.objects.create_or_update(
+            type_name=self.ACTION_ITEM_TYPE_NAME,
+            full_description_template=self.ITEM_FULL_DESCRIPTION_TEMPLATE)
+        self._tag_severities = {}
+
+    def set_parameters(self, parameters):
+        if 'force_update' in parameters:
+            self.force_update = parameters['force_update']
+
+    def _load_tag_severities(self):
+        url = 'https://appstream.debian.org/hints/asgen-hints.json'
+        cache = HttpCache(settings.DISTRO_TRACKER_CACHE_DIRECTORY)
+        response, updated = cache.update(url, force=True)
+        response.raise_for_status()
+
+        data = response.json()
+        for tag, info in data.items():
+            self._tag_severities[tag] = info['severity']
+
+    def _load_appstream_hint_stats(self, section, arch, all_stats={}):
+        url = 'https://appstream.debian.org/hints/sid/{section}/Hints-{arch}.json.gz'.format(section=section, arch=arch)
+        cache = HttpCache(settings.DISTRO_TRACKER_CACHE_DIRECTORY)
+        response, _ = cache.update(url, force=self.force_update)
+        response.raise_for_status()
+
+        jdata = zlib.decompress(response.content, 16 + zlib.MAX_WBITS)
+        hints = json.loads(jdata)
+        for hint in hints:
+            pkid = hint['package']
+            parts = pkid.split('/')
+            package_name = parts[0]
+
+            # get the source package for this binary package name
+            src_pkgname = None
+            if SourcePackageName.objects.exists_with_name(package_name):
+                package = SourcePackageName.objects.get(name=package_name)
+                src_pkgname = package.name
+            elif BinaryPackageName.objects.exists_with_name(package_name):
+                bin_package = BinaryPackageName.objects.get(name=package_name)
+                package = bin_package.main_source_package_name
+                src_pkgname = package.name
+            else:
+                src_pkgname = package_name
+
+            if not src_pkgname in all_stats:
+                all_stats[src_pkgname] = {}
+            for cid, h in hint['hints'].items():
+                for e in h:
+                    severity = self._tag_severities[e['tag']]
+                    sevkey = "errors"
+                    if severity == "warning":
+                        sevkey = "warnings"
+                    elif severity == "info":
+                        sevkey = "infos"
+                    if not sevkey in all_stats[src_pkgname]:
+                        all_stats[src_pkgname][sevkey] = 1
+                    else:
+                        all_stats[src_pkgname][sevkey] += 1
+
+        return all_stats
+
+    def update_action_item(self, package, as_stats):
+        """
+        Updates the :class:`ActionItem` for the given package based on the
+        :class:`AppStreamStats <distro_tracker.vendor.debian.models.AppStreamStats`
+        given in ``as_stats``. If the package has errors or warnings an
+        :class:`ActionItem` is created.
+        """
+        package_stats = as_stats.stats
+        stats_warnings = package_stats.get('warnings')
+        stats_errors = package_stats.get('errors', 0)
+        warnings, errors = (stats_warnings if stats_warnings else 0,
+                            stats_errors if stats_errors else 0)
+
+        # Get the old action item for this warning, if it exists.
+        appstream_action_item = package.get_action_item_for_type(
+            self.appstream_action_item_type.type_name)
+        if not warnings and not errors:
+            if appstream_action_item:
+                # If the item previously existed, delete it now since there
+                # are no longer any warnings/errors.
+                appstream_action_item.delete()
+            return
+
+        # The item didn't previously have an action item: create it now
+        if appstream_action_item is None:
+            appstream_action_item = ActionItem(
+                package=package,
+                item_type=self.appstream_action_item_type)
+
+        appstream_url = as_stats.get_appstream_url()
+        new_extra_data = {
+            'warnings': warnings,
+            'errors': errors,
+            'appstream_url': appstream_url,
+        }
+        if appstream_action_item.extra_data:
+            old_extra_data = appstream_action_item.extra_data
+            if (old_extra_data['warnings'] == warnings and
+                    old_extra_data['errors'] == errors):
+                # No need to update
+                return
+
+        appstream_action_item.extra_data = new_extra_data
+
+        if errors and warnings:
+            report = '{} error{} and {} warning{}'.format(
+                errors,
+                's' if errors > 1 else '',
+                warnings,
+                's' if warnings > 1 else '')
+        elif errors:
+            report = '{} error{}'.format(
+                errors,
+                's' if errors > 1 else '')
+        elif warnings:
+            report = '{} warning{}'.format(
+                warnings,
+                's' if warnings > 1 else '')
+
+        appstream_action_item.short_description = self.ITEM_DESCRIPTION.format(
+            url=appstream_url,
+            report=report)
+
+        # If there are errors make the item a high severity issue
+        if errors:
+            appstream_action_item.severity = ActionItem.SEVERITY_HIGH
+
+        appstream_action_item.save()
+
+    def execute(self):
+        self._load_tag_severities()
+        all_stats = {}
+        self._load_appstream_hint_stats("non-free", "amd64", all_stats)
+        self._load_appstream_hint_stats("contrib", "amd64", all_stats)
+        self._load_appstream_hint_stats("main", "amd64", all_stats)
+        if not all_stats:
+            return
+
+        # Discard all old hints
+        AppStreamStats.objects.all().delete()
+
+        packages = PackageName.objects.filter(name__in=all_stats.keys())
+        packages.prefetch_related('action_items')
+        # Remove action items for packages which no longer have associated
+        # AppStream hints.
+        ActionItem.objects.delete_obsolete_items(
+            [self.appstream_action_item_type], all_stats.keys())
+
+        stats = []
+        for package in packages:
+            package_stats = all_stats[package.name]
+            # Save the raw AppStream hints
+            as_stats = AppStreamStats(package=package, stats=package_stats)
+            stats.append(as_stats)
+            # Create an ActionItem if there are errors or warnings
+            self.update_action_item(package, as_stats)
+
+        AppStreamStats.objects.bulk_create(stats)
 
 
 class UpdateTransitionsTask(BaseTask):
